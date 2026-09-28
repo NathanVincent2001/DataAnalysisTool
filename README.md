@@ -1,51 +1,52 @@
 # Data Analysis Tool for Scientists
 
-A Python desktop application for loading, exploring, plotting and exporting scientific CSV data, with dedicated support for conventional date/time values and Modified Julian Date (MJD).
+A PySide6 desktop application for loading CSV data, selecting scientific data series, filtering by time, plotting data with Matplotlib, viewing summary statistics, and exporting plots.
 
-## Current Features
+## Recent interface and plotting updates
 
-### CSV and data handling
+### Y-series selection
+- Y-series controls use a compact horizontal, scrollable selector.
+- Numeric measurement columns can be selected independently.
+- Selected series are visually highlighted and use colours matching their plotted series.
+- Detected time columns remain available for the X axis but are excluded from Y-series choices.
 
-- Load CSV datasets through a desktop file picker.
-- Automatically detect likely datetime and MJD columns.
-- Keep all columns available for the X axis.
-- Restrict the Y axis to numeric measurement columns while excluding detected time columns.
-- Highlight detected time columns in blue and bold in the X-axis selector.
-- Configure Matplotlib path chunking for large plotted datasets.
+### X-axis controls
+- The X-axis selector has stronger visual styling so it is easier to identify.
+- Detected time columns are highlighted in the selector.
+- Selecting a non-time X axis shows a small inline `* Non-time X axis` notice rather than an intrusive warning.
+- Time-specific controls are disabled when the X axis is not a detected time column.
 
-### Time and MJD support
+### Date/time and MJD support
+- Time columns are detected from datetime-like columns and MJD data.
+- The displayed time axis can be switched between **Date / Time** and **MJD**.
+- Start and end date/time controls show their corresponding MJD values alongside them.
+- The End MJD value is positioned directly beside the End date/time control for a cleaner layout.
 
-- Work with CSV files containing standard date/time values.
-- Work with CSV files containing native Modified Julian Date values.
-- Convert between Date/Time and MJD using `astropy.time.Time`.
-- Display either Date/Time or MJD regardless of the time format stored in the source CSV.
-- Show live MJD equivalents beside the selected Start and End date/time controls.
+### Quick time ranges
+The Time Range panel provides these shortcuts:
 
-### Time-range selection
+`Full` · `1h` · `2h` · `6h` · `12h` · `1d` · `2d` · `3d` · `7d` · `14d` · `30d`
 
-The application provides Start and End controls for filtering time-series data, along with quick-range buttons for:
+Quick ranges are calculated backwards from the latest timestamp in the dataset and are constrained by the available data range.
 
-- Full dataset
-- 1 hour
-- 6 hours
-- 24 hours
-- 7 days
-- 30 days
+The active quick-range option is visually highlighted so the selected range is clear.
 
-Statistics and plots are calculated from the currently selected range.
+### Plot layout
+- **Separate plots** is now the default layout.
+- **Overlay** remains available from the Layout selector.
+- The Layout selector has updated styling to make it easier to distinguish from other controls.
 
-### Plotting
+### Plot export
+Plots can be saved as:
+- PNG
+- SVG
+- PDF
+- JPEG
 
-- Matplotlib plot embedded directly in the PySide6 interface.
-- Selectable X and Y columns.
-- Automatic date formatting for Date/Time axes.
-- Plain full-value formatting for MJD axes.
-- Axis labels, plot title and grid.
+Raster exports provide selectable DPI settings of **300**, **600**, and **1200 DPI**.
 
 ### Statistics
-
-The statistics panel displays:
-
+For each selected Y series, the Statistics panel displays:
 - Count
 - Mean
 - Median
@@ -54,25 +55,9 @@ The statistics panel displays:
 - Maximum
 - Range
 
-Statistics update for the data included in the current plot.
+Statistics use the same series colours as the corresponding plots.
 
-### Plot export
-
-Plots can be exported as:
-
-- PNG
-- JPEG
-- PDF
-- SVG
-
-The exported report-style figure includes:
-
-- The plotted data
-- Statistics panel
-- Selected Start and End date/times when a time axis is used
-- Corresponding Start and End MJD values
-
-## Technology
+## Core dependencies
 
 - Python
 - PySide6
@@ -80,23 +65,17 @@ The exported report-style figure includes:
 - Matplotlib
 - Astropy
 
-## Project Structure
+## Typical workflow
 
-The current application uses:
+1. Click **Load CSV** and select a dataset.
+2. Choose the X axis.
+3. Select one or more Y series.
+4. If using a time X axis, select a quick range or set Start and End manually.
+5. Choose **Separate plots** or **Overlay**.
+6. Choose **Date / Time** or **MJD** when applicable.
+7. Click **Plot**.
+8. Review the statistics and optionally save the plot.
 
-- `main.py` for the PySide6 interface, time handling, plotting and export workflow.
-- `analysis.py` for CSV loading and statistical calculations.
+## Notes
 
-## Running the Application
-
-Activate the project's Python environment, ensure the required packages are installed, then run:
-
-```bash
-python main.py
-```
-
-## Current Status
-
-The project currently provides a working foundation for interactive scientific CSV analysis, including time-range filtering, Date/Time and MJD interoperability, descriptive statistics, plotting and report-style figure export.
-
-Further functionality can be added incrementally while retaining the current working application as a baseline.
+The application keeps native MJD values numeric while providing converted calendar date/time controls for selecting ranges. Date/time data can also be displayed as MJD when plotting.
