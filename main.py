@@ -344,27 +344,89 @@ class MainWindow(QMainWindow):
         for control in controls:
             control.setEnabled(enabled)
 
+    def normalise_datetime_columns(self):
+        """
+        Convert all detected datetime columns to timezone-naive
+        datetime64[ns] values.
+
+        Handles:
+            2026-08-25 13:09:41
+            2026-08-25T13:09:41+01:00
+            2026-08-25T12:09:41Z
+
+        by converting through UTC then removing timezone information.
+        """
+
+        if self.data is None:
+            return
+
+        for column in self.data.columns:
+
+            if self.is_mjd_column(column):
+                continue
+
+            column_name = str(column).lower()
+
+            looks_like_time = (
+                "time" in column_name
+                or "date" in column_name
+            )
+
+            already_datetime = pd.api.types.is_datetime64_any_dtype(
+                self.data[column]
+            )
+
+            if not looks_like_time and not already_datetime:
+                continue
+
+            try:
+                converted = pd.to_datetime(
+                    self.data[column],
+                    errors="coerce",
+                    utc=True
+                )
+
+                if converted.notna().any():
+
+                    converted = converted.dt.tz_localize(None)
+
+                    self.data[column] = converted
+
+            except Exception:
+                pass
+
+
     def detect_time_columns(self):
-        """Find likely datetime and MJD columns without removing X-axis choices."""
+        """Find likely datetime and MJD columns."""
         candidates = []
         if self.data is None:
             return candidates
-
         for column in self.data.columns:
             if self.is_mjd_column(column):
-                numeric = pd.to_numeric(self.data[column], errors="coerce")
+                numeric = pd.to_numeric(
+                    self.data[column],
+                    errors="coerce"
+                )
                 if numeric.notna().any():
                     candidates.append(column)
                 continue
-
-            name_hint = "time" in str(column).lower() or "date" in str(column).lower()
-            if pd.api.types.is_datetime64_any_dtype(self.data[column]):
+            if pd.api.types.is_datetime64_any_dtype(
+                self.data[column]
+            ):
                 candidates.append(column)
                 continue
+            name_hint = (
+                "time" in str(column).lower()
+                or "date" in str(column).lower()
+            )
             if name_hint:
-                converted = pd.to_datetime(self.data[column], errors="coerce")
+                converted = pd.to_datetime(
+                    self.data[column],
+                    errors="coerce"
+                )
                 if converted.notna().any():
                     candidates.append(column)
+
         return candidates
 
     def is_mjd_column(self, column):
@@ -434,14 +496,12 @@ class MainWindow(QMainWindow):
         if self.is_mjd_column(column):
             converted = self.mjd_to_datetime(self.data[column])
         else:
-            converted = pd.to_datetime(self.data[column], errors="coerce")
+            converted = self.data[column]
 
         if converted.notna().sum() == 0:
             raise ValueError(f"'{column}' could not be interpreted as a time column.")
 
         # Keep native MJD numeric. Calendar controls use a converted datetime view only.
-        if not self.is_mjd_column(column):
-            self.data[column] = converted
 
         valid = converted.dropna()
         minimum = valid.min()
@@ -478,7 +538,7 @@ class MainWindow(QMainWindow):
         if self.is_mjd_column(column):
             valid = self.mjd_to_datetime(self.data[column]).dropna()
         else:
-            valid = pd.to_datetime(self.data[column], errors="coerce").dropna()
+            valid = self.data[column].dropna()
         if valid.empty:
             return
         minimum = valid.min()
@@ -541,6 +601,9 @@ class MainWindow(QMainWindow):
 
         try:
             self.data = load_csv(filepath)
+            # Normalise all timestamp columns immediately.
+            self.normalise_datetime_columns()
+
             self.current_statistics = None
             self.current_plot_data = None
             self.current_display_x = None
@@ -726,7 +789,7 @@ class MainWindow(QMainWindow):
         try:
             plot_data = self.data
             if self.is_time_column(x_column):
-                series = self.mjd_to_datetime(self.data[x_column]) if self.is_mjd_column(x_column) else pd.to_datetime(self.data[x_column], errors="coerce")
+                series = (self.mjd_to_datetime(self.data[x_column]) if self.is_mjd_column(x_column) else self.data[x_column])
                 start = pd.Timestamp(self.start_time.dateTime().toPython()); end = pd.Timestamp(self.end_time.dateTime().toPython())
                 if start > end: raise ValueError("Start time must be before end time.")
                 mask = series.notna() & (series >= start) & (series <= end)
@@ -741,7 +804,7 @@ class MainWindow(QMainWindow):
                 if using_mjd:
                     display_x = pd.to_numeric(plot_data[x_column], errors="coerce") if native_mjd else self.datetime_to_mjd(plot_data[x_column]); x_label = "MJD"
                 else:
-                    display_x = self.mjd_to_datetime(plot_data[x_column]) if native_mjd else pd.to_datetime(plot_data[x_column], errors="coerce"); x_label = "Date / Time"
+                    display_x = (self.mjd_to_datetime(plot_data[x_column]) if native_mjd else plot_data[x_column]); x_label = "Date / Time"
             mode = self.plot_mode_selector.currentText(); colours = self.series_colours(y_columns)
             self.current_statistics = statistics; self.current_plot_data = plot_data.copy()
             self.current_display_x = display_x.copy() if hasattr(display_x, "copy") else display_x
