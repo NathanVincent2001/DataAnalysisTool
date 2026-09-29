@@ -4,14 +4,16 @@ import pandas as pd
 from astropy.time import Time
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog, QComboBox, QDateTimeEdit, QGroupBox, QGridLayout, QCheckBox, QScrollArea
+    QPushButton, QFileDialog, QComboBox, QDateTimeEdit, QGroupBox, QGridLayout, QCheckBox, QScrollArea, QDoubleSpinBox
 )
 from PySide6.QtCore import QDateTime, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtGui import QColor, QFont, QPalette
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from analysis import load_csv, calculate_statistics
+from matplotlib.widgets import SpanSelector
+import matplotlib.dates as mdates
+from analysis import load_csv, calculate_statistics, detect_anomalies
 import matplotlib as mpl
 mpl.rcParams["agg.path.chunksize"] = 10000
 
@@ -23,6 +25,135 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.axes = self.figure.add_subplot(111)
         super().__init__(self.figure)
 
+
+
+class PlotInspector(QMainWindow):
+    """Interactive inspector for a single series or an overlaid set of series."""
+    def __init__(self, parent, plot_data, x_column, y_columns, colours,
+                 using_mjd, sigma_threshold, is_time_axis, native_mjd=False):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.y_columns = list(y_columns)
+        self.colours = colours
+        self.plot_data = plot_data.copy()
+        self.x_column = x_column
+        self.is_time_axis = is_time_axis
+        self.native_mjd = native_mjd
+        self.using_mjd = using_mjd
+        self.sigma_threshold = sigma_threshold
+        self.view_data = self.plot_data
+        title_text = self.y_columns[0] if len(self.y_columns) == 1 else "Overlay"
+        self.setWindowTitle(f"Plot Inspector - {title_text}")
+        self.resize(1100, 720)
+
+        central = QWidget(); root = QVBoxLayout(central)
+        tools = QHBoxLayout()
+        self.range_label = QLabel("Full plotted range")
+        self.axis_label = QLabel("Time axis")
+        self.axis_selector = QComboBox()
+        self.axis_selector.setObjectName("timeAxisSelector")
+        self.axis_selector.setFixedHeight(36)
+        self.axis_selector.setMinimumWidth(130)
+        self.axis_selector.addItems(["Date / Time", "MJD"])
+        self.axis_selector.setCurrentText("MJD" if using_mjd else "Date / Time")
+        self.axis_selector.setEnabled(is_time_axis)
+        self.reset_button = QPushButton("Reset Range"); self.reset_button.setObjectName("inspectorResetButton"); self.reset_button.setMinimumSize(140, 38)
+        self.save_button = QPushButton("Save Plot"); self.save_button.setObjectName("inspectorSaveButton"); self.save_button.setMinimumSize(140, 38)
+        self.anomaly_toggle = QCheckBox("Show anomaly markers"); self.anomaly_toggle.setObjectName("anomalyToggle"); self.anomaly_toggle.setChecked(True)
+        tools.addWidget(self.range_label, 1)
+        tools.addWidget(self.axis_label); tools.addWidget(self.axis_selector)
+        tools.addWidget(self.anomaly_toggle); tools.addWidget(self.reset_button); tools.addWidget(self.save_button)
+        root.addLayout(tools)
+
+        body = QHBoxLayout(); plot_box = QVBoxLayout()
+        self.figure = Figure(); self.canvas = FigureCanvasQTAgg(self.figure); self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        plot_box.addWidget(self.toolbar); plot_box.addWidget(self.canvas, 1); body.addLayout(plot_box, 4)
+        stats_box = QVBoxLayout(); stats_title = QLabel("Statistics"); f=QFont(); f.setBold(True); f.setPointSize(14); stats_title.setFont(f)
+        self.stats_label=QLabel(); self.stats_label.setTextFormat(Qt.RichText); self.stats_label.setAlignment(Qt.AlignTop)
+        stats_box.addWidget(stats_title); stats_box.addWidget(self.stats_label); stats_box.addStretch()
+        sw=QWidget(); sw.setLayout(stats_box); body.addWidget(sw, 1); root.addLayout(body, 1)
+        self.setCentralWidget(central)
+        self.setStyleSheet("""
+            QPushButton#inspectorResetButton { background: #1976d2; color: white; border: none; border-radius: 7px; padding: 7px 16px; font-size: 14px; font-weight: 800; }
+            QPushButton#inspectorSaveButton { background: #008b95; color: white; border: none; border-radius: 7px; padding: 7px 16px; font-size: 14px; font-weight: 800; }
+            QCheckBox#anomalyToggle { color: #9b1c1c; background: #fff5f5; border: 2px solid #ef9a9a; border-radius: 7px; padding: 7px 12px; font-weight: 800; }
+            QComboBox#timeAxisSelector { min-height: 30px; padding: 1px 7px; border: 2px solid #80aee0; border-radius: 6px; background: #f4f9ff; color: #1f2937; font-weight: 600; }
+            QComboBox#timeAxisSelector:hover { border-color: #5b96d6; background: #eaf4ff; }
+        """)
+        self.reset_button.clicked.connect(self.reset_range); self.save_button.clicked.connect(self.save_plot)
+        self.anomaly_toggle.toggled.connect(self.draw); self.axis_selector.currentTextChanged.connect(self.change_time_axis)
+        self.draw()
+
+    def _display_x(self, data):
+        source = data[self.x_column]
+        if not self.is_time_axis:
+            return source, self.x_column
+        if self.using_mjd:
+            if self.native_mjd:
+                return pd.to_numeric(source, errors="coerce"), "MJD"
+            converted = pd.to_datetime(source, errors="coerce")
+            result = pd.Series(float("nan"), index=source.index, dtype="float64")
+            valid = converted.notna()
+            if valid.any():
+                result.loc[valid] = Time([v.to_pydatetime() for v in converted.loc[valid]], scale="utc").mjd
+            return result, "MJD"
+        if self.native_mjd:
+            numeric = pd.to_numeric(source, errors="coerce")
+            result = pd.Series(pd.NaT, index=source.index, dtype="datetime64[ns]")
+            valid = numeric.notna()
+            if valid.any():
+                result.loc[valid] = pd.to_datetime(Time(numeric.loc[valid].to_numpy(dtype=float), format="mjd", scale="utc").to_datetime())
+            return result, "Date / Time"
+        return pd.to_datetime(source, errors="coerce"), "Date / Time"
+
+    def _stats_html(self):
+        blocks=[]
+        for column in self.y_columns:
+            st=calculate_statistics(self.view_data, column); an=detect_anomalies(self.plot_data, column, self.sigma_threshold)
+            colour=self.colours[column]
+            blocks.append(f'<b style="color:{colour};font-size:12pt">{column}</b><br>'
+                          f'Count: {st["count"]}<br>Mean: {st["mean"]:.6g}<br>Median: {st["median"]:.6g}<br>'
+                          f'Std dev: {st["std_dev"]:.6g}<br>Min: {st["min"]:.6g}<br>Max: {st["max"]:.6g}<br>'
+                          f'Range: {st["range"]:.6g}<br><b>Potential anomalies: {an["count"]}</b>')
+        return '<br><br>'.join(blocks)
+
+    def draw(self):
+        self.figure.clear(); ax=self.figure.add_subplot(111); display_x, x_label=self._display_x(self.view_data)
+        for column in self.y_columns:
+            ax.plot(display_x, self.view_data[column], color=self.colours[column], label=column)
+            # Anomaly classification is anchored to the inspector's full plotted X range.
+            # Zooming/selecting only changes which already-classified points are visible.
+            full_an = detect_anomalies(self.plot_data, column, self.sigma_threshold)
+            mask = full_an['mask'].reindex(self.view_data.index, fill_value=False)
+            if self.anomaly_toggle.isChecked() and mask.any():
+                ax.scatter(display_x.loc[mask], self.view_data.loc[mask,column], s=60, facecolors='none', edgecolors='#d32f2f', linewidths=1.8, zorder=5)
+        ax.set_title(self.y_columns[0] if len(self.y_columns)==1 else 'Overlay: ' + ', '.join(self.y_columns), fontweight='bold')
+        ax.set_ylabel(self.y_columns[0] if len(self.y_columns)==1 else 'Value'); ax.set_xlabel(x_label); ax.grid(True)
+        if self.using_mjd and self.is_time_axis: ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+        if self.is_time_axis and not self.using_mjd: self.figure.autofmt_xdate()
+        self.figure.tight_layout(); self.stats_label.setText(self._stats_html()); self.canvas.draw_idle()
+        self.span=SpanSelector(ax, self.select_range, 'horizontal', useblit=True, props=dict(alpha=.18, facecolor='#1976d2'), interactive=True, drag_from_anywhere=True)
+
+    def change_time_axis(self, text):
+        if not self.is_time_axis: return
+        self.using_mjd = text == "MJD"; self.reset_range()
+
+    def select_range(self, xmin, xmax):
+        display_x, _=self._display_x(self.plot_data)
+        if self.is_time_axis and not self.using_mjd:
+            vals=mdates.date2num(pd.to_datetime(display_x).dt.to_pydatetime())
+        else: vals=pd.to_numeric(display_x, errors='coerce').to_numpy()
+        mask=pd.Series((vals >= min(xmin,xmax)) & (vals <= max(xmin,xmax)), index=self.plot_data.index)
+        if not mask.any(): return
+        self.view_data=self.plot_data.loc[mask].copy(); self.range_label.setText(f"Selected range: {len(self.view_data)} points"); self.draw()
+
+    def reset_range(self):
+        self.view_data=self.plot_data; self.range_label.setText("Full plotted range"); self.draw()
+
+    def save_plot(self):
+        default = self.y_columns[0] if len(self.y_columns)==1 else "overlay"
+        path,_=QFileDialog.getSaveFileName(self,"Save Inspector Plot",f"{default}.png","PNG Image (*.png);;SVG Vector Image (*.svg);;PDF Document (*.pdf);;JPEG Image (*.jpg *.jpeg)")
+        if path: self.figure.savefig(path, dpi=300, bbox_inches='tight')
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -41,53 +172,68 @@ class MainWindow(QMainWindow):
         self.current_plot_mode = "Separate plots"
         self.current_series_colours = {}
         self.current_using_mjd = False
+        self.current_anomalies = {}
+        self.plot_inspectors = []
+        self.popout_buttons = []
+        self.popout_button_layout = None
+        self.current_sigma_threshold = 5.0
 
         self.file_label = QLabel("No CSV loaded")
         self.load_button = QPushButton("Load CSV")
         self.load_button.setObjectName("loadButton")
-        self.load_button.setMinimumSize(140, 36)
+        self.load_button.setMinimumSize(125, 32)
 
-        self.x_label = QLabel("X Axis")
+        self.x_label = QLabel("X-axis")
+        self.x_label.setObjectName("axisHeading")
         self.x_selector = QComboBox()
         self.x_selector.setObjectName("xAxisSelector")
         self.x_selector.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.x_selector.setMinimumContentsLength(10)
-        self.y_label = QLabel("Y Axes")
-        self.y_selector = QGroupBox("Choose Y series")
-        y_selector_layout = QVBoxLayout(self.y_selector)
-        y_selector_layout.setContentsMargins(6, 8, 6, 6)
-        self.y_scroll = QScrollArea()
-        self.y_scroll.setWidgetResizable(True)
-        self.y_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.y_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.y_scroll.setFrameShape(QScrollArea.NoFrame)
-        self.y_scroll.setFixedHeight(48)
-        self.y_scroll_content = QWidget()
-        self.y_grid = QGridLayout(self.y_scroll_content)
-        self.y_grid.setContentsMargins(2, 2, 2, 2)
-        self.y_grid.setHorizontalSpacing(10)
-        self.y_grid.setVerticalSpacing(0)
-        self.y_grid.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.y_scroll.setWidget(self.y_scroll_content)
-        y_selector_layout.addWidget(self.y_scroll)
-        self.y_selector.setFixedHeight(78)
+        self.y_label = QLabel("Choose Y-axis")
+        self.y_label.setObjectName("axisHeading")
+        self.y_selector = QGroupBox()
+        self.y_selector.setObjectName("yAxisSelectorBox")
+        self.y_grid = QGridLayout(self.y_selector)
+        self.y_grid.setContentsMargins(6, 5, 6, 5)
+        self.y_grid.setHorizontalSpacing(6)
+        self.y_grid.setVerticalSpacing(4)
+        self.y_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.y_checkboxes = []
         self.plot_mode_label = QLabel("Layout")
+        self.plot_mode_label.setObjectName("optionLabel")
         self.plot_mode_selector = QComboBox()
         self.plot_mode_selector.addItems(["Overlay", "Separate plots"])
         self.plot_mode_selector.setCurrentText("Separate plots")
         self.plot_mode_selector.setObjectName("layoutSelector")
         self.plot_mode_selector.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.sigma_label = QLabel("Anomaly sensitivity")
+        self.sigma_label.setObjectName("optionLabel")
+        self.sigma_selector = QDoubleSpinBox()
+        self.sigma_selector.setRange(0.1, 100.0)
+        self.sigma_selector.setDecimals(1)
+        self.sigma_selector.setSingleStep(0.5)
+        self.sigma_selector.setValue(5.0)
+        self.sigma_selector.setSuffix(" sigma")
+        self.sigma_selector.setObjectName("sigmaSelector")
+        self.sigma_selector.setFixedWidth(112)
+        self.sigma_selector.setToolTip(
+            "Flag points whose absolute deviation from the mean is at least this many standard deviations."
+        )
+        self.main_anomaly_toggle = QCheckBox("Anomaly markers")
+        self.main_anomaly_toggle.setObjectName("anomalyPill")
+        self.main_anomaly_toggle.setChecked(True)
+        self.main_anomaly_toggle.setToolTip("Show or hide potential-anomaly markers on the main plots")
         self.plot_button = QPushButton("Plot")
         self.plot_button.setObjectName("plotButton")
-        self.plot_button.setMinimumSize(155, 38)
+        self.plot_button.setMinimumSize(140, 34)
         self.save_plot_button = QPushButton("Save Plot")
         self.save_plot_button.setObjectName("saveButton")
-        self.save_plot_button.setMinimumSize(120, 36)
+        self.save_plot_button.setMinimumSize(110, 34)
         self.save_plot_button.setEnabled(False)
         self.export_dpi_selector = QComboBox()
+        self.export_dpi_selector.setObjectName("dpiSelector")
         self.export_dpi_selector.addItems(["300 DPI", "600 DPI", "1200 DPI"])
-        self.export_dpi_selector.setCurrentText("1200 DPI")
+        self.export_dpi_selector.setCurrentText("300 DPI")
         self.export_dpi_selector.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.export_dpi_selector.setToolTip("Resolution used for raster exports such as PNG and JPEG")
 
@@ -143,7 +289,7 @@ class MainWindow(QMainWindow):
             self.fortnight_button, self.month_button
         ):
             button.setProperty("quickRange", True)
-            button.setMinimumSize(58, 27)
+            button.setFixedSize(52, 26)
         self.set_time_controls_enabled(False)
 
         self.canvas = PlotCanvas()
@@ -164,6 +310,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             QMainWindow { background: #f4f7fb; }
             QLabel { color: #243447; }
+            QLabel#axisHeading {
+                color: #172033; font-size: 16px; font-weight: 800; padding-bottom: 1px;
+            }
             QLabel#statsTitle {
                 color: #172033; font-size: 18px; font-weight: 800;
                 padding: 4px 0 6px 0;
@@ -172,12 +321,12 @@ class MainWindow(QMainWindow):
                 background: #ffffff;
                 border: 1px solid #d8e0ea;
                 border-radius: 9px;
-                margin-top: 12px;
-                padding-top: 10px;
+                margin-top: 16px;
+                padding-top: 14px;
                 font-weight: 600;
                 color: #243447;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
+            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; top: 1px; padding: 2px 6px; background: #ffffff; }
             QComboBox, QDateTimeEdit {
                 min-height: 26px; padding: 1px 7px; border: 1px solid #bcc8d6;
                 border-radius: 6px; background: white; color: #1f2937;
@@ -209,16 +358,33 @@ class MainWindow(QMainWindow):
                 font-weight: 700; min-height: 30px;
             }
             QComboBox#layoutSelector:hover { border-color: #3f8d63; background: #e8f6ee; }
+            QLabel#optionLabel { color: #536273; font-weight: 700; }
+            QDoubleSpinBox#sigmaSelector { min-height: 30px; padding: 1px 10px; border: 2px solid #c6a7e8; border-radius: 9px; background: #faf6ff; color: #593a78; font-weight: 700; }
+            QDoubleSpinBox#sigmaSelector:focus { border-color: #9b72cf; background: #f5edff; }
+            QCheckBox#anomalyPill { spacing: 7px; color: #65411e; background: #fff8e8; border: 2px solid #efc676; border-radius: 10px; padding: 5px 10px; font-weight: 700; }
+            QCheckBox#anomalyPill:hover { background: #fff1ce; border-color: #dfa94b; }
+            QCheckBox#anomalyPill::indicator { width: 17px; height: 17px; }
+            QComboBox#dpiSelector { min-height: 30px; padding: 1px 9px; border: 2px solid #8fc5bf; border-radius: 9px; background: #f0faf8; color: #24625c; font-weight: 700; }
+            QComboBox#dpiSelector:hover { background: #e4f5f2; border-color: #62aaa2; }
             QLabel#xAxisWarning {
                 color: #9a6700; font-size: 11px; font-style: italic;
                 padding-left: 2px;
             }
+            QPushButton[popoutButton="true"] {
+                background: #e8f0f7; color: #345166; border: 1px solid #a9bdcc;
+                border-radius: 7px; padding: 6px 10px; font-size: 12px; font-weight: 700;
+            }
+            QPushButton[popoutButton="true"]:hover { background: #dbe8f2; border-color: #829fb4; }
+            QWidget[statsCard="true"] {
+                background: #ffffff; border: 1px solid #d8e0ea; border-radius: 9px;
+            }
+            QLabel[statsData="true"] { color: #243447; font-size: 13px; }
             QCheckBox { color: #334155; }
         """)
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(12, 8, 12, 8)
-        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(8, 6, 8, 6)
+        main_layout.setSpacing(4)
 
         # Top-left primary data action.
         file_bar = QHBoxLayout()
@@ -231,85 +397,101 @@ class MainWindow(QMainWindow):
         # Plot setup keeps all plotting choices together.
         plot_setup = QGroupBox("Plot Setup")
         plot_setup_layout = QVBoxLayout(plot_setup)
-        plot_setup_layout.setContentsMargins(10, 12, 10, 8)
-        plot_setup_layout.setSpacing(5)
+        plot_setup_layout.setContentsMargins(8, 8, 8, 5)
+        plot_setup_layout.setSpacing(2)
 
-        setup_top = QHBoxLayout()
-        setup_top.setSpacing(10)
-        setup_top.addWidget(self.x_label)
-        setup_top.addWidget(self.x_selector)
-        setup_top.addWidget(self.x_axis_warning)
-        setup_top.addStretch(1)
-        setup_top.addWidget(self.plot_mode_label)
-        setup_top.addWidget(self.plot_mode_selector)
+        axis_row = QHBoxLayout()
+        axis_row.setSpacing(14)
 
-        time_axis_group = QGroupBox("Time axis")
-        time_axis_group_layout = QHBoxLayout(time_axis_group)
-        time_axis_group_layout.setContentsMargins(8, 10, 8, 5)
-        time_axis_group_layout.addWidget(self.time_axis_selector)
-        setup_top.addWidget(time_axis_group)
-        plot_setup_layout.addLayout(setup_top)
+        x_axis_panel = QVBoxLayout()
+        x_axis_panel.setSpacing(5)
+        x_axis_panel.addWidget(self.x_label)
+        x_axis_controls = QHBoxLayout()
+        x_axis_controls.addWidget(self.x_selector)
+        x_axis_controls.addWidget(self.x_axis_warning)
+        x_axis_controls.addStretch(1)
+        x_axis_panel.addLayout(x_axis_controls)
+        x_axis_panel.addStretch(1)
+        axis_row.addLayout(x_axis_panel, 0)
 
-        # Retain the successful checkbox grid for selecting Y series.
-        plot_setup_layout.addWidget(self.y_selector)
+        y_axis_panel = QVBoxLayout()
+        y_axis_panel.setSpacing(5)
+        y_axis_panel.addWidget(self.y_label)
+        y_axis_panel.addWidget(self.y_selector)
+        axis_row.addLayout(y_axis_panel, 0)
 
+        plot_options = QVBoxLayout()
+        plot_options.setSpacing(5)
+        option_row = QHBoxLayout()
+        option_row.setSpacing(8)
+        option_row.setAlignment(Qt.AlignVCenter)
+        option_row.addWidget(self.plot_mode_label)
+        self.plot_mode_selector.setFixedHeight(36)
+        self.plot_mode_selector.setMinimumWidth(145)
+        option_row.addWidget(self.plot_mode_selector)
+        self.time_axis_label.setObjectName("optionLabel")
+        option_row.addSpacing(8)
+        option_row.addWidget(self.time_axis_label)
+        self.time_axis_selector.setFixedHeight(36)
+        self.time_axis_selector.setMinimumWidth(130)
+        option_row.addWidget(self.time_axis_selector)
+        plot_options.addLayout(option_row)
+        plot_options.addStretch(1)
+        axis_row.addStretch(1)
+        axis_row.addLayout(plot_options, 0)
+
+        plot_setup_layout.addLayout(axis_row)
         action_row = QHBoxLayout()
         action_row.addStretch()
+        action_row.addWidget(self.sigma_label)
+        action_row.addWidget(self.sigma_selector)
+        action_row.addWidget(self.main_anomaly_toggle)
+        action_row.addSpacing(10)
+        export_label = QLabel("Export")
+        export_label.setObjectName("optionLabel")
+        action_row.addWidget(export_label)
         action_row.addWidget(self.export_dpi_selector)
         action_row.addWidget(self.save_plot_button)
         action_row.addWidget(self.plot_button)
         plot_setup_layout.addLayout(action_row)
         main_layout.addWidget(plot_setup, 0)
 
-        # Time range controls are visually separated from plot configuration.
+        # Compact single-line time range controls.
         time_range_group = QGroupBox("Time Range")
-        time_range_group_layout = QVBoxLayout(time_range_group)
-        time_range_group_layout.setContentsMargins(10, 12, 10, 7)
-        time_range_group_layout.setSpacing(4)
-        time_layout = QHBoxLayout()
-        time_layout.addWidget(self.start_label)
+        time_range_group_layout = QHBoxLayout(time_range_group)
+        # Give the single-line controls enough vertical breathing room so the
+        # group title and taller date widgets never overlap the results area.
+        time_range_group_layout.setContentsMargins(8, 18, 8, 8)
+        time_range_group_layout.setSpacing(5)
+        time_range_group_layout.setAlignment(Qt.AlignVCenter)
+        time_range_group_layout.addWidget(self.start_label)
         self.start_time.setFixedWidth(220)
-        time_layout.addWidget(self.start_time)
-        time_layout.addWidget(self.start_mjd_label)
-        time_layout.addSpacing(16)
-        time_layout.addWidget(self.end_label)
+        time_range_group_layout.addWidget(self.start_time)
+        time_range_group_layout.addWidget(self.start_mjd_label)
+        time_range_group_layout.addSpacing(8)
+        time_range_group_layout.addWidget(self.end_label)
         self.end_time.setFixedWidth(220)
-        time_layout.addWidget(self.end_time)
-        time_layout.addWidget(self.end_mjd_label)
-        time_layout.addStretch(1)
-        time_range_group_layout.addLayout(time_layout)
-
-        quick_range_layout = QHBoxLayout()
-        quick_range_layout.setSpacing(4)
-        quick_range_layout.addWidget(QLabel("Quick range:"))
-        quick_range_layout.addWidget(self.full_range_button)
-        quick_range_layout.addWidget(self.one_hour_button)
-        quick_range_layout.addWidget(self.two_hour_button)
-        quick_range_layout.addWidget(self.six_hour_button)
-        quick_range_layout.addWidget(self.twelve_hour_button)
-        quick_range_layout.addWidget(self.day_button)
-        quick_range_layout.addWidget(self.two_day_button)
-        quick_range_layout.addWidget(self.three_day_button)
-        quick_range_layout.addWidget(self.week_button)
-        quick_range_layout.addWidget(self.fortnight_button)
-        quick_range_layout.addWidget(self.month_button)
-        quick_range_layout.addStretch()
-        time_range_group_layout.addLayout(quick_range_layout)
-        time_range_group.setMaximumHeight(120)
+        time_range_group_layout.addWidget(self.end_time)
+        time_range_group_layout.addWidget(self.end_mjd_label)
+        time_range_group_layout.addSpacing(12)
+        time_range_group_layout.addWidget(QLabel("Quick range:"))
+        for button in self.quick_range_buttons:
+            time_range_group_layout.addWidget(button)
+        time_range_group_layout.addStretch(1)
+        time_range_group.setMinimumHeight(76)
+        time_range_group.setMaximumHeight(82)
         main_layout.addWidget(time_range_group, 0)
-
-        stats_layout = QVBoxLayout()
-        stats_layout.setContentsMargins(10, 8, 10, 8)
-        stats_layout.addWidget(self.stats_title)
-        stats_layout.addWidget(self.stats_label)
-        stats_layout.addStretch()
-        stats_widget = QWidget()
-        stats_widget.setLayout(stats_layout)
-        results_layout = QHBoxLayout()
-        results_layout.setSpacing(14)
-        results_layout.addWidget(self.canvas, 4)
-        results_layout.addWidget(stats_widget, 1)
-        main_layout.addLayout(results_layout, 4)
+        # Scrollable result area. Separate mode is built as one row per series so
+        # graph, pop-out control and statistics always remain aligned.
+        self.results_scroll = QScrollArea()
+        self.results_scroll.setWidgetResizable(True)
+        self.results_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.results_content = QWidget()
+        self.results_rows = QVBoxLayout(self.results_content)
+        self.results_rows.setContentsMargins(2, 2, 2, 2)
+        self.results_rows.setSpacing(10)
+        self.results_scroll.setWidget(self.results_content)
+        main_layout.addWidget(self.results_scroll, 4)
         main_layout.addWidget(self.status_label)
         container = QWidget()
         container.setLayout(main_layout)
@@ -332,6 +514,7 @@ class MainWindow(QMainWindow):
         self.time_axis_selector.currentTextChanged.connect(self.time_axis_display_changed)
         self.start_time.dateTimeChanged.connect(self.update_mjd_reference_labels)
         self.end_time.dateTimeChanged.connect(self.update_mjd_reference_labels)
+        self.main_anomaly_toggle.toggled.connect(self.create_plot)
 
     def set_time_controls_enabled(self, enabled):
         controls = [
@@ -344,91 +527,65 @@ class MainWindow(QMainWindow):
         for control in controls:
             control.setEnabled(enabled)
 
+    @staticmethod
+    def _datetime_parse_candidate(series, sample_size=200, minimum_success=0.90):
+        """Return True when a non-numeric column strongly resembles datetime data."""
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return True
+        if pd.api.types.is_numeric_dtype(series):
+            return False
+        sample = series.dropna().astype(str).str.strip()
+        sample = sample[sample.ne("")].head(sample_size)
+        if sample.empty:
+            return False
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce", utc=True)
+        except Exception:
+            return False
+        return float(parsed.notna().mean()) >= minimum_success
+
     def normalise_datetime_columns(self):
-        """
-        Convert all detected datetime columns to timezone-naive
-        datetime64[ns] values.
-
-        Handles:
-            2026-08-25 13:09:41
-            2026-08-25T13:09:41+01:00
-            2026-08-25T12:09:41Z
-
-        by converting through UTC then removing timezone information.
-        """
-
+        """Convert name-hinted or content-inferred datetime columns to datetime64[ns]."""
         if self.data is None:
             return
-
         for column in self.data.columns:
-
             if self.is_mjd_column(column):
                 continue
-
+            series = self.data[column]
             column_name = str(column).lower()
-
-            looks_like_time = (
-                "time" in column_name
-                or "date" in column_name
-            )
-
-            already_datetime = pd.api.types.is_datetime64_any_dtype(
-                self.data[column]
-            )
-
-            if not looks_like_time and not already_datetime:
+            name_hint = "time" in column_name or "date" in column_name
+            already_datetime = pd.api.types.is_datetime64_any_dtype(series)
+            content_hint = self._datetime_parse_candidate(series)
+            if not (name_hint or already_datetime or content_hint):
                 continue
-
             try:
-                converted = pd.to_datetime(
-                    self.data[column],
-                    errors="coerce",
-                    utc=True
-                )
-
-                if converted.notna().any():
-
-                    converted = converted.dt.tz_localize(None)
-
-                    self.data[column] = converted
-
+                converted = pd.to_datetime(series, errors="coerce", utc=True)
+                # Require strong content evidence when there was no explicit name/type hint.
+                nonempty = series.notna().sum()
+                success = converted.notna().sum() / nonempty if nonempty else 0.0
+                if converted.notna().any() and (name_hint or already_datetime or success >= 0.90):
+                    self.data[column] = converted.dt.tz_localize(None)
             except Exception:
                 pass
 
-
     def detect_time_columns(self):
-        """Find likely datetime and MJD columns."""
+        """Find native MJD, parsed datetime, and strongly datetime-like text columns."""
         candidates = []
         if self.data is None:
             return candidates
         for column in self.data.columns:
+            series = self.data[column]
             if self.is_mjd_column(column):
-                numeric = pd.to_numeric(
-                    self.data[column],
-                    errors="coerce"
-                )
+                numeric = pd.to_numeric(series, errors="coerce")
                 if numeric.notna().any():
                     candidates.append(column)
                 continue
-            if pd.api.types.is_datetime64_any_dtype(
-                self.data[column]
-            ):
+            if pd.api.types.is_datetime64_any_dtype(series):
                 candidates.append(column)
                 continue
-            name_hint = (
-                "time" in str(column).lower()
-                or "date" in str(column).lower()
-            )
-            if name_hint:
-                converted = pd.to_datetime(
-                    self.data[column],
-                    errors="coerce"
-                )
-                if converted.notna().any():
-                    candidates.append(column)
-
+            if self._datetime_parse_candidate(series):
+                candidates.append(column)
         return candidates
-
     def is_mjd_column(self, column):
         """Return True when a column name identifies Modified Julian Date."""
         normalised = str(column).strip().lower().replace("_", " ").replace("-", " ")
@@ -641,18 +798,23 @@ class MainWindow(QMainWindow):
                 checkbox = QCheckBox(column)
                 checkbox.setChecked(index == 0)
                 checkbox.setToolTip(f"Include {column} in the plot")
-                checkbox.setFixedHeight(30)
-                checkbox.setMinimumWidth(150)
-                checkbox.setMaximumWidth(210)
+                checkbox.setFixedHeight(28)
+                checkbox.setFixedWidth(150)
                 checkbox.stateChanged.connect(
                     lambda _state: self.update_y_selector_colours(self.current_series_colours)
                 )
                 self.y_checkboxes.append(checkbox)
+                # Keep the selector compact: fill exactly two rows, expanding
+                # horizontally to suit however many Y series the dataset contains.
+                columns_per_row = max(1, (len(y_columns) + 1) // 2)
+                row = index // columns_per_row
+                grid_column = index % columns_per_row
                 self.y_grid.addWidget(
-                    checkbox, 0, index,
+                    checkbox, row, grid_column,
                     alignment=Qt.AlignLeft | Qt.AlignVCenter
                 )
-            self.y_grid.setColumnStretch(len(y_columns), 1)
+            for grid_column in range(columns_per_row):
+                self.y_grid.setColumnStretch(grid_column, 0)
             self.update_y_selector_colours()
 
             if self.possible_time_columns:
@@ -715,37 +877,53 @@ class MainWindow(QMainWindow):
                     "QCheckBox::indicator { width: 16px; height: 16px; }"
                 )
 
-    def statistics_html(self, statistics_by_column, colours):
+    def statistics_html(self, statistics_by_column, colours, anomalies_by_column):
         blocks = []
         for column, statistics in statistics_by_column.items():
             colour = self.qt_colour_string(colours.get(column, "#222222"))
             blocks.append(
-                f'<span style="color: {colour}; font-weight: 700; font-size: 12pt;">{column}</span><br>'
+                f'<span style="color: {colour}; font-weight: 700; font-size: 14pt;">{column}</span><br>'
                 f"Count: {statistics['count']}<br>"
                 f"Mean: {statistics['mean']:.6g}<br>"
                 f"Median: {statistics['median']:.6g}<br>"
                 f"Std dev: {statistics['std_dev']:.6g}<br>"
                 f"Min: {statistics['min']:.6g}<br>"
                 f"Max: {statistics['max']:.6g}<br>"
-                f"Range: {statistics['range']:.6g}"
+                f"Range: {statistics['range']:.6g}<br>"
+                f'<span style="font-weight: 700;">Potential anomalies: '
+                f"{anomalies_by_column[column]['count']}</span><br>"
+                f"Threshold: {anomalies_by_column[column]['threshold']:.1f} sigma<br>"
+                f"Maximum deviation: {anomalies_by_column[column]['max_deviation_sigma']:.2f} sigma"
             )
         return "<br><br>".join(blocks)
 
-    def draw_series(self, figure, display_x, plot_data, x_label, y_columns, mode, using_mjd, colours):
+    def draw_series(self, figure, display_x, plot_data, x_label, y_columns, mode, using_mjd, colours, anomalies_by_column, show_anomalies=True):
         figure.clear()
         if mode == "Overlay":
             axes = [figure.add_subplot(111)]
             ax = axes[0]
             for column in y_columns:
-                ax.plot(display_x, plot_data[column], label=column, color=colours[column])
+                ax.plot(display_x, plot_data[column], color=colours[column])
+                anomaly_mask = anomalies_by_column[column]["mask"]
+                if show_anomalies and anomaly_mask.any():
+                    ax.scatter(
+                        display_x.loc[anomaly_mask], plot_data.loc[anomaly_mask, column],
+                        s=52, facecolors="none", edgecolors="#d32f2f", linewidths=1.8,
+                        marker="o", zorder=5
+                    )
             ax.set_ylabel("Value" if len(y_columns) > 1 else y_columns[0])
             ax.set_title(f"{', '.join(y_columns)} vs {x_label}")
-            if len(y_columns) > 1:
-                ax.legend()
         else:
             axes = figure.subplots(len(y_columns), 1, sharex=True, squeeze=False).ravel().tolist()
             for ax, column in zip(axes, y_columns):
                 ax.plot(display_x, plot_data[column], label=column, color=colours[column])
+                anomaly_mask = anomalies_by_column[column]["mask"]
+                if show_anomalies and anomaly_mask.any():
+                    ax.scatter(
+                        display_x.loc[anomaly_mask], plot_data.loc[anomaly_mask, column],
+                        s=52, facecolors="none", edgecolors="#d32f2f", linewidths=1.8,
+                        marker="o", label="Potential anomaly", zorder=5
+                    )
                 ax.set_ylabel(column)
                 ax.set_title(column, color=colours[column], fontweight="bold")
         for ax in axes:
@@ -754,6 +932,76 @@ class MainWindow(QMainWindow):
                 ax.ticklabel_format(axis="x", style="plain", useOffset=False)
         axes[-1].set_xlabel(x_label)
         return axes
+
+    def open_plot_inspector(self, column=None):
+        if self.current_plot_data is None or not self.current_y_columns:
+            return
+        columns = self.current_y_columns if column is None else [column]
+        if any(c not in self.current_y_columns for c in columns):
+            return
+        x_column = self.x_selector.currentText()
+        inspector = PlotInspector(
+            self, self.current_plot_data, x_column, columns, self.current_series_colours,
+            self.current_using_mjd, self.current_sigma_threshold,
+            self.is_time_column(x_column), self.is_mjd_column(x_column)
+        )
+        self.plot_inspectors.append(inspector)
+        inspector.destroyed.connect(lambda *_: self.plot_inspectors.remove(inspector) if inspector in self.plot_inspectors else None)
+        inspector.show()
+
+    def update_popout_buttons(self):
+        """Pop-out controls are now created beside each separate plot row."""
+        return
+
+    def clear_results_rows(self):
+        while self.results_rows.count():
+            item = self.results_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def populate_results_area(self, display_x, plot_data, x_label, y_columns, mode,
+                              using_mjd, colours, statistics, anomalies):
+        self.clear_results_rows()
+        if mode == "Overlay":
+            row = QWidget(); layout = QHBoxLayout(row); layout.setContentsMargins(4, 4, 4, 8)
+            canvas = PlotCanvas(); canvas.setMinimumHeight(510)
+            self.draw_series(canvas.figure, display_x, plot_data, x_label, y_columns, mode,
+                             using_mjd, colours, anomalies, self.main_anomaly_toggle.isChecked())
+            canvas.figure.subplots_adjust(bottom=0.16)
+            canvas.draw_idle(); layout.addWidget(canvas, 7)
+            card = QWidget(); card.setProperty("statsCard", True); card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(14, 12, 14, 12)
+            stats = QLabel(self.statistics_html(statistics, colours, anomalies)); stats.setTextFormat(Qt.RichText); stats.setProperty("statsData", True); stats.setAlignment(Qt.AlignTop)
+            card_layout.addWidget(stats, 1)
+            overlay_button = QPushButton("Pop out overlay")
+            overlay_button.setProperty("popoutButton", True)
+            overlay_button.setToolTip("Open the overlaid graph in the interactive Plot Inspector")
+            overlay_button.clicked.connect(lambda _=False: self.open_plot_inspector())
+            card_layout.addWidget(overlay_button, 0, Qt.AlignVCenter)
+            layout.addWidget(card, 1); row._canvas = canvas; self.results_rows.addWidget(row)
+        else:
+            for column in y_columns:
+                row = QWidget(); row.setMinimumHeight(350)
+                layout = QHBoxLayout(row); layout.setContentsMargins(4, 4, 4, 8); layout.setSpacing(10)
+                canvas = PlotCanvas(); canvas.setMinimumHeight(334)
+                self.draw_series(canvas.figure, display_x, plot_data, x_label, [column], "Separate plots",
+                                 using_mjd, colours, {column: anomalies[column]}, self.main_anomaly_toggle.isChecked())
+                # Reserve a larger lower margin so Date / Time stays inside the plot's white canvas.
+                canvas.figure.subplots_adjust(left=0.09, right=0.98, top=0.88, bottom=0.20)
+                canvas.draw_idle(); layout.addWidget(canvas, 7)
+
+                card = QWidget(); card.setProperty("statsCard", True); card.setMinimumWidth(275); card.setMaximumWidth(330)
+                card_layout = QHBoxLayout(card); card_layout.setContentsMargins(14, 12, 12, 12); card_layout.setSpacing(10)
+                stats = QLabel(self.statistics_html({column: statistics[column]}, colours, {column: anomalies[column]}))
+                stats.setTextFormat(Qt.RichText); stats.setProperty("statsData", True); stats.setAlignment(Qt.AlignTop); stats.setMinimumWidth(180)
+                card_layout.addWidget(stats, 1, Qt.AlignVCenter)
+                button = QPushButton("Pop out"); button.setProperty("popoutButton", True); button.setFixedWidth(82)
+                button.clicked.connect(lambda _=False, c=column: self.open_plot_inspector(c))
+                card_layout.addWidget(button, 0, Qt.AlignVCenter)
+                layout.addWidget(card, 1)
+                row._canvas = canvas; self.results_rows.addWidget(row)
+        self.results_rows.addStretch()
 
     def save_plot(self):
         filepath, selected_filter = QFileDialog.getSaveFileName(
@@ -769,7 +1017,7 @@ class MainWindow(QMainWindow):
             export_figure = Figure(figsize=(12, max(7, 3 * len(self.current_y_columns))))
             self.draw_series(export_figure, self.current_display_x, self.current_plot_data,
                              self.current_x_label, self.current_y_columns, self.current_plot_mode,
-                             self.current_using_mjd, self.current_series_colours)
+                             self.current_using_mjd, self.current_series_colours, self.current_anomalies)
             if self.is_time_column(self.x_selector.currentText()) and not self.current_using_mjd:
                 export_figure.autofmt_xdate()
             export_figure.tight_layout()
@@ -797,6 +1045,11 @@ class MainWindow(QMainWindow):
                 if not self.is_mjd_column(x_column): plot_data[x_column] = series.loc[mask]
                 if plot_data.empty: raise ValueError("No data exists in the selected time range.")
             statistics = {c: calculate_statistics(plot_data, c) for c in y_columns}
+            sigma_threshold = self.sigma_selector.value()
+            anomalies = {
+                c: detect_anomalies(plot_data, c, sigma_threshold)
+                for c in y_columns
+            }
             display_x = plot_data[x_column]; x_label = x_column
             native_mjd = self.is_mjd_column(x_column)
             using_mjd = self.is_time_column(x_column) and self.time_axis_selector.currentText() == "MJD"
@@ -810,12 +1063,10 @@ class MainWindow(QMainWindow):
             self.current_display_x = display_x.copy() if hasattr(display_x, "copy") else display_x
             self.current_x_label = x_label; self.current_y_columns = y_columns
             self.current_plot_mode = mode; self.current_using_mjd = using_mjd; self.current_series_colours = colours
+            self.current_anomalies = anomalies; self.current_sigma_threshold = sigma_threshold
             self.update_y_selector_colours(colours)
-            self.draw_series(self.canvas.figure, display_x, plot_data, x_label, y_columns, mode, using_mjd, colours)
-            if self.is_time_column(x_column) and not using_mjd: self.canvas.figure.autofmt_xdate()
-            self.canvas.figure.tight_layout(); self.canvas.draw_idle(); self.save_plot_button.setEnabled(True)
-            self.stats_label.setTextFormat(Qt.RichText)
-            self.stats_label.setText(self.statistics_html(statistics, colours))
+            self.populate_results_area(display_x, plot_data, x_label, y_columns, mode, using_mjd, colours, statistics, anomalies)
+            self.save_plot_button.setEnabled(True)
             self.status_label.setText(f"Plotted {len(plot_data)} points for {len(y_columns)} series vs {x_column} ({mode}).")
         except Exception as error:
             self.status_label.setText(f"Error: {error}")

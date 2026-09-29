@@ -70,22 +70,35 @@ def select_column(columns, message="Select column"):
         print("Please enter one of the numbers shown above.")
 
 
+def _datetime_parse_candidate(series, sample_size=200, minimum_success=0.90):
+    """Return True when a non-numeric column strongly resembles datetime data."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    if pd.api.types.is_numeric_dtype(series):
+        return False
+    sample = series.dropna().astype(str).str.strip()
+    sample = sample[sample.ne("")].head(sample_size)
+    if sample.empty:
+        return False
+    parsed = pd.to_datetime(sample, errors="coerce", utc=True)
+    return float(parsed.notna().mean()) >= minimum_success
+
+
 def detect_time_column(dataframe):
-    """
-    Look for column names that appear to contain timestamps.
-    """
-    timestamp_columns = [
-        column for column in dataframe.columns
-        if "time" in column.lower()
-        or "date" in column.lower()
-    ]
-
-    if timestamp_columns:
-        return timestamp_columns[0]
-
+    """Detect a likely timestamp column from its type, name, or values."""
+    # Prefer already parsed datetime columns and explicit naming hints.
+    for column in dataframe.columns:
+        series = dataframe[column]
+        name = str(column).lower()
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return column
+        if ("time" in name or "date" in name) and _datetime_parse_candidate(series):
+            return column
+    # Fall back to content-based detection for blank/misleading headers.
+    for column in dataframe.columns:
+        if _datetime_parse_candidate(dataframe[column]):
+            return column
     return None
-
-
 def select_time_range(dataframe, time_column):
     """
     Display available time range and allow selection
@@ -159,6 +172,54 @@ def calculate_statistics(dataframe, column):
         "min": series.min(),
         "max": series.max(),
         "range": series.max() - series.min()
+    }
+
+
+def detect_anomalies(dataframe, column, sigma_threshold=5.0):
+    """
+    Flag potential anomalies whose absolute deviation from the mean is
+    greater than or equal to ``sigma_threshold * standard deviation``.
+
+    The calculation is performed only on the supplied dataframe, so callers
+    can pass an already filtered time range. The returned mask preserves the
+    dataframe index for straightforward plotting.
+    """
+    if sigma_threshold <= 0:
+        raise ValueError("Sigma threshold must be greater than zero.")
+
+    series = pd.to_numeric(dataframe[column], errors="coerce")
+    valid = series.dropna()
+    mask = pd.Series(False, index=dataframe.index, dtype=bool)
+
+    if valid.empty:
+        return {
+            "mask": mask,
+            "count": 0,
+            "threshold": float(sigma_threshold),
+            "max_deviation_sigma": 0.0,
+        }
+
+    mean = valid.mean()
+    std_dev = valid.std()
+
+    # A constant series, or a series with too few values for sample standard
+    # deviation, cannot produce a meaningful sigma-based anomaly score.
+    if pd.isna(std_dev) or std_dev == 0:
+        return {
+            "mask": mask,
+            "count": 0,
+            "threshold": float(sigma_threshold),
+            "max_deviation_sigma": 0.0,
+        }
+
+    sigma_distance = (series - mean).abs() / std_dev
+    mask = sigma_distance.ge(float(sigma_threshold)) & series.notna()
+
+    return {
+        "mask": mask,
+        "count": int(mask.sum()),
+        "threshold": float(sigma_threshold),
+        "max_deviation_sigma": float(sigma_distance.max()),
     }
 
 
