@@ -42,6 +42,8 @@ class PlotInspector(QMainWindow):
         self.using_mjd = using_mjd
         self.sigma_threshold = sigma_threshold
         self.view_data = self.plot_data
+        self.series_visible = {column: True for column in self.y_columns}
+        self.series_visibility_checkboxes = {}
         title_text = self.y_columns[0] if len(self.y_columns) == 1 else "Overlay"
         self.setWindowTitle(f"Plot Inspector - {title_text}")
         self.resize(1100, 720)
@@ -70,13 +72,24 @@ class PlotInspector(QMainWindow):
         plot_box.addWidget(self.toolbar); plot_box.addWidget(self.canvas, 1); body.addLayout(plot_box, 4)
         stats_box = QVBoxLayout(); stats_title = QLabel("Statistics"); f=QFont(); f.setBold(True); f.setPointSize(14); stats_title.setFont(f)
         self.stats_label=QLabel(); self.stats_label.setTextFormat(Qt.RichText); self.stats_label.setAlignment(Qt.AlignTop)
-        stats_box.addWidget(stats_title); stats_box.addWidget(self.stats_label); stats_box.addStretch()
+        stats_box.addWidget(stats_title)
+        for column in self.y_columns:
+            visibility = QCheckBox(f"Show {column}")
+            visibility.setObjectName("seriesVisibilityToggle")
+            visibility.setChecked(True)
+            visibility.setProperty("seriesColour", self.colours[column])
+            visibility.toggled.connect(lambda checked, c=column: self.set_series_visibility(c, checked))
+            self.series_visibility_checkboxes[column] = visibility
+            stats_box.addWidget(visibility)
+        stats_box.addWidget(self.stats_label); stats_box.addStretch()
         sw=QWidget(); sw.setLayout(stats_box); body.addWidget(sw, 1); root.addLayout(body, 1)
         self.setCentralWidget(central)
         self.setStyleSheet("""
             QPushButton#inspectorResetButton { background: #1976d2; color: white; border: none; border-radius: 7px; padding: 7px 16px; font-size: 14px; font-weight: 800; }
             QPushButton#inspectorSaveButton { background: #008b95; color: white; border: none; border-radius: 7px; padding: 7px 16px; font-size: 14px; font-weight: 800; }
             QCheckBox#anomalyToggle { color: #9b1c1c; background: #fff5f5; border: 2px solid #ef9a9a; border-radius: 7px; padding: 7px 12px; font-weight: 800; }
+            QCheckBox#seriesVisibilityToggle { color: #334155; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 5px 8px; font-weight: 800; }
+            QCheckBox#seriesVisibilityToggle:hover { background: #eef6ff; border-color: #93b9df; }
             QComboBox#timeAxisSelector { min-height: 30px; padding: 1px 7px; border: 2px solid #80aee0; border-radius: 6px; background: #f4f9ff; color: #1f2937; font-weight: 600; }
             QComboBox#timeAxisSelector:hover { border-color: #5b96d6; background: #eaf4ff; }
         """)
@@ -109,17 +122,24 @@ class PlotInspector(QMainWindow):
     def _stats_html(self):
         blocks=[]
         for column in self.y_columns:
+            if not self.series_visible.get(column, True):
+                continue
             st=calculate_statistics(self.view_data, column); an=detect_anomalies(self.plot_data, column, self.sigma_threshold)
             colour=self.colours[column]
             blocks.append(f'<b style="color:{colour};font-size:12pt">{column}</b><br>'
                           f'Count: {st["count"]}<br>Mean: {st["mean"]:.6g}<br>Median: {st["median"]:.6g}<br>'
                           f'Std dev: {st["std_dev"]:.6g}<br>Min: {st["min"]:.6g}<br>Max: {st["max"]:.6g}<br>'
                           f'Range: {st["range"]:.6g}<br><b>Potential anomalies: {an["count"]}</b>')
-        return '<br><br>'.join(blocks)
+        return '<br><br>'.join(blocks) if blocks else '<i>No series visible</i>'
+
+    def set_series_visibility(self, column, visible):
+        self.series_visible[column] = visible
+        self.draw()
 
     def draw(self):
         self.figure.clear(); ax=self.figure.add_subplot(111); display_x, x_label=self._display_x(self.view_data)
-        for column in self.y_columns:
+        visible_columns = [column for column in self.y_columns if self.series_visible.get(column, True)]
+        for column in visible_columns:
             ax.plot(display_x, self.view_data[column], color=self.colours[column], label=column)
             # Anomaly classification is anchored to the inspector's full plotted X range.
             # Zooming/selecting only changes which already-classified points are visible.
@@ -127,8 +147,13 @@ class PlotInspector(QMainWindow):
             mask = full_an['mask'].reindex(self.view_data.index, fill_value=False)
             if self.anomaly_toggle.isChecked() and mask.any():
                 ax.scatter(display_x.loc[mask], self.view_data.loc[mask,column], s=60, facecolors='none', edgecolors='#d32f2f', linewidths=1.8, zorder=5)
-        ax.set_title(self.y_columns[0] if len(self.y_columns)==1 else 'Overlay: ' + ', '.join(self.y_columns), fontweight='bold')
-        ax.set_ylabel(self.y_columns[0] if len(self.y_columns)==1 else 'Value'); ax.set_xlabel(x_label); ax.grid(True)
+        if visible_columns:
+            ax.set_title(visible_columns[0] if len(visible_columns)==1 else 'Overlay: ' + ', '.join(visible_columns), fontweight='bold')
+            ax.set_ylabel(visible_columns[0] if len(visible_columns)==1 else 'Value')
+            ax.relim(); ax.autoscale_view()
+        else:
+            ax.set_title('No series visible', fontweight='bold'); ax.set_ylabel('Value')
+        ax.set_xlabel(x_label); ax.grid(True)
         if self.using_mjd and self.is_time_axis: ax.ticklabel_format(axis='x', style='plain', useOffset=False)
         if self.is_time_axis and not self.using_mjd: self.figure.autofmt_xdate()
         self.figure.tight_layout(); self.stats_label.setText(self._stats_html()); self.canvas.draw_idle()
@@ -199,6 +224,10 @@ class MainWindow(QMainWindow):
         self.y_grid.setVerticalSpacing(4)
         self.y_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.y_checkboxes = []
+        self.toggle_all_y_button = QPushButton("Select All")
+        self.toggle_all_y_button.setObjectName("toggleAllYButton")
+        self.toggle_all_y_button.setMinimumSize(105, 30)
+        self.toggle_all_y_button.setToolTip("Select or deselect all Y-axis series")
         self.plot_mode_label = QLabel("Layout")
         self.plot_mode_label.setObjectName("optionLabel")
         self.plot_mode_selector = QComboBox()
@@ -339,6 +368,12 @@ class MainWindow(QMainWindow):
             QPushButton#saveButton { background: #008b95; color: white; border: none; }
             QPushButton#saveButton:hover { background: #00747c; }
             QPushButton#saveButton:disabled { background: #b9c5cc; color: #eef2f4; }
+            QPushButton#toggleAllYButton {
+                background: #eef2ff; color: #4338ca; border: 2px solid #a5b4fc;
+                border-radius: 8px; padding: 5px 12px; font-weight: 800;
+            }
+            QPushButton#toggleAllYButton:hover { background: #e0e7ff; border-color: #818cf8; }
+            QPushButton#toggleAllYButton:pressed { background: #c7d2fe; border-color: #6366f1; }
             QPushButton[quickRange="true"] {
                 background: #edf2f7; color: #334155; border: 1px solid #cbd5e1;
                 border-radius: 5px; padding: 5px 10px;
@@ -416,7 +451,11 @@ class MainWindow(QMainWindow):
 
         y_axis_panel = QVBoxLayout()
         y_axis_panel.setSpacing(5)
-        y_axis_panel.addWidget(self.y_label)
+        y_axis_header = QHBoxLayout()
+        y_axis_header.addWidget(self.y_label)
+        y_axis_header.addStretch(1)
+        y_axis_header.addWidget(self.toggle_all_y_button)
+        y_axis_panel.addLayout(y_axis_header)
         y_axis_panel.addWidget(self.y_selector)
         axis_row.addLayout(y_axis_panel, 0)
 
@@ -499,6 +538,7 @@ class MainWindow(QMainWindow):
         self.load_button.clicked.connect(self.load_csv_file)
         self.plot_button.clicked.connect(self.create_plot)
         self.save_plot_button.clicked.connect(self.save_plot)
+        self.toggle_all_y_button.clicked.connect(self.toggle_all_y_columns)
         self.x_selector.currentTextChanged.connect(self.x_axis_changed)
         self.full_range_button.clicked.connect(lambda: self.reset_time_range(self.full_range_button))
         self.one_hour_button.clicked.connect(lambda: self.set_quick_range(hours=1, button=self.one_hour_button))
@@ -840,6 +880,28 @@ class MainWindow(QMainWindow):
     def selected_y_columns(self):
         return [checkbox.text() for checkbox in self.y_checkboxes if checkbox.isChecked()]
 
+    def toggle_all_y_columns(self):
+        """Select every Y-axis series, or clear them all when all are selected."""
+        if not self.y_checkboxes:
+            return
+
+        should_select = not all(
+            checkbox.isChecked() for checkbox in self.y_checkboxes
+        )
+        for checkbox in self.y_checkboxes:
+            checkbox.setChecked(should_select)
+
+        self.update_y_selector_colours(self.current_series_colours)
+
+    def update_toggle_all_y_button(self):
+        """Keep the Select All / Deselect All label in sync."""
+        all_selected = bool(self.y_checkboxes) and all(
+            checkbox.isChecked() for checkbox in self.y_checkboxes
+        )
+        self.toggle_all_y_button.setText(
+            "Deselect All" if all_selected else "Select All"
+        )
+
     @staticmethod
     def qt_colour_string(colour):
         """Convert any Matplotlib colour representation to Qt/HTML-safe hex."""
@@ -857,6 +919,7 @@ class MainWindow(QMainWindow):
 
     def update_y_selector_colours(self, colours=None):
         colours = colours or {}
+        self.update_toggle_all_y_button()
         for checkbox in self.y_checkboxes:
             selected = checkbox.isChecked()
             colour = self.qt_colour_string(colours.get(checkbox.text(), "#1976D2"))
